@@ -5,5 +5,9 @@
   "zip": "85281",
   "default_budget": 30,
   "category_budgets": { "belt": 25, "sunscreen": 15 },
-  "delivery_pref": "fast"
+  "delivery_pref": "fast",
+  "Home_lat":33.419353,
+  "Home_lon":-111.92267,
+  "work_lat":33.42308,
+  "work_lon":-111.920652
 }
