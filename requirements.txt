@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+requests
+python-dotenv
+pydantic
+streamlit
+langgraph
+google-api-python-client
+google-auth
+google-auth-oauthlib

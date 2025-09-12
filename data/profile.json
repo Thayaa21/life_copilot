@@ -1,0 +1,9 @@
+{
+  "name": "You",
+  "is_student": true,
+  "city": "Tempe, AZ",
+  "zip": "85281",
+  "default_budget": 30,
+  "category_budgets": { "belt": 25, "sunscreen": 15 },
+  "delivery_pref": "fast"
+}

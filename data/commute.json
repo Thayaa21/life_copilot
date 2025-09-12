@@ -1,0 +1,6 @@
+{
+  "home":   { "lat": 33.424, "lon": -111.928 },
+  "office": { "lat": 33.424, "lon": -111.940 },
+  "arrive_by": "09:00",
+  "buffer_minutes": 10
+}
