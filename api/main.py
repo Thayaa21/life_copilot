@@ -1,21 +1,87 @@
 import os, json
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
-from fastapi import Body, HTTPException
 import datetime as dt
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from api.tools_places import search_along_route, PlacesError
-from api.tools_places_osm import search_along_route as osm_search_along_route, PlacesError
-from api.agent import plan_event, decide_actions, find_products, find_otw
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Query
+from fastapi.responses import JSONResponse
+
 from api.tools_weather import get_weather
+from api.tools_commute import get_commute, CommuteError
+from api.tools_calendar import connect as cal_connect, get_events_today_and_tomorrow, add_reminder, add_event
+
+# ★ Use only the OSM implementation (avoid name clash on PlacesError)
+from api.tools_places_osm import search_along_route as osm_search_along_route, PlacesError
+
+from api.agent import plan_event, decide_actions, find_products, find_otw
+
+# ★ CSV/rule parser + LLM parser come from different modules
+from api.schedule_parser import parse_schedule, extract_text
+from api.schedule_llm import llm_parse_schedule
+
+from api.brief import compose_and_optionally_commit
+from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
+BRIEF_ENABLED = os.getenv("BRIEF_ENABLED", "true").lower() == "true"
+BRIEF_TIME = os.getenv("BRIEF_TIME", "07:00")  # HH:MM local
+_scheduler = None
 app = FastAPI(title="Life Copilot API")
 
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True})
+
+def _reschedule_brief(hhmm: str, enabled: bool):
+    global _scheduler
+    if not BRIEF_ENABLED:
+        return
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler()
+        _scheduler.start(paused=False)
+
+    # clear existing jobs
+    for job in list(_scheduler.get_jobs()):
+        _scheduler.remove_job(job.id)
+
+    if not enabled:
+        return
+
+    import re
+    m = re.match(r"^(\d{2}):(\d{2})$", hhmm or "")
+    if not m:
+        hhmm = BRIEF_TIME
+        m = re.match(r"^(\d{2}):(\d{2})$", hhmm)
+    H, M = int(m.group(1)), int(m.group(2))
+
+    # run daily at local tz (America/Phoenix)
+    _scheduler.add_job(
+        func=lambda: compose_and_optionally_commit(create_leave_event=True),
+        trigger="cron",
+        hour=H, minute=M, second=0,
+        id="daily_brief",
+        replace_existing=True
+    )
+
+# kick scheduler on startup with defaults or persisted config
+@app.on_event("startup")
+def _startup_schedule():
+    if not BRIEF_ENABLED:
+        return
+    try:
+        import json as _json, os as _os
+        cfg_path = "data/brief.json"
+        time_ = BRIEF_TIME
+        enabled_ = True
+        if _os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                cfg = _json.load(f)
+                time_ = cfg.get("time", time_)
+                enabled_ = bool(cfg.get("enabled", True))
+        _reschedule_brief(time_, enabled_)
+    except Exception:
+        pass
 
 def _load_profile_coords():
     # fallback if file is missing
@@ -30,6 +96,52 @@ def _load_profile_coords():
     except Exception:
         pass
     return lat, lon
+@app.post("/brief/run")
+def brief_run(payload: dict = Body(None)):
+    """
+    Run the Daily Brief now. payload: {"create_leave_event": true/false}
+    Returns: {report_path, report_md, created_leave, plan, act, inputs}
+    """
+    if not BRIEF_ENABLED:
+        raise HTTPException(status_code=503, detail="brief_disabled")
+    try:
+        flag = True
+        if payload and "create_leave_event" in payload:
+            flag = bool(payload["create_leave_event"])
+        out = compose_and_optionally_commit(create_leave_event=flag)
+        return JSONResponse(out)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"brief_run_failed: {e}")
+
+@app.post("/brief/config")
+def brief_config(payload: dict = Body(...)):
+    """
+    Set daily brief time. payload: {"time":"HH:MM", "enabled": true/false}
+    Persists to data/brief.json
+    """
+    try:
+        cfg_path = "data/brief.json"
+        os.makedirs("data", exist_ok=True)
+        current = {}
+        if os.path.exists(cfg_path):
+            import json as _json
+            with open(cfg_path) as f: current = _json.load(f)
+        # update
+        if "time" in payload:
+            current["time"] = payload["time"]
+        if "enabled" in payload:
+            current["enabled"] = bool(payload["enabled"])
+        # default if missing
+        current.setdefault("time", BRIEF_TIME)
+        current.setdefault("enabled", True)
+        # write
+        import json as _json
+        with open(cfg_path, "w") as f: _json.dump(current, f)
+        # reschedule
+        _reschedule_brief(current.get("time"), current.get("enabled", True))
+        return JSONResponse({"ok": True, "config": current})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"brief_config_failed: {e}")
 
 @app.get("/weather")
 def weather():
@@ -266,15 +378,68 @@ def agent_act(payload: dict):
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"agent_act_failed: {e}")
     
-@app.post("/agent/plan")
-def agent_plan(payload: dict):
+@app.post("/schedule/ingest")
+async def schedule_ingest(
+    file: UploadFile = File(...),
+    default_year: int = Form(None),
+    use_llm: bool | str = Form(False)   # accept str "true"/"false" from forms too
+):
+    """
+    Upload schedule (csv/txt/ics/pdf/png/jpg). If use_llm=true, parse with LLM.
+    Returns proposed events plus any 'assumptions'. If LLM fails, falls back to rule parser.
+    """
     try:
-        events = payload.get("events", [])
-        weather = payload.get("weather_brief", "")
-        plan = plan_event(events, weather)
-        return JSONResponse({"plan": plan})
+        # normalize bool from form strings
+        if isinstance(use_llm, str):
+            use_llm = use_llm.strip().lower() in ("1", "true", "yes", "y", "on")
+
+        blob = await file.read()
+        year = default_year or datetime.now().year
+
+        # OCR/text extraction (your schedule_parser does this)
+        text = extract_text(file.filename, blob)
+
+        if use_llm:
+            try:
+                parsed = llm_parse_schedule(text, year, tz=TZ)
+                events = parsed.get("events", [])
+                assumptions = parsed.get("assumptions", [])
+                return JSONResponse({"proposed": events, "assumptions": assumptions, "used": "llm"})
+            except Exception as e:
+                # FALLBACK to rule-based if LLM path fails
+                events = parse_schedule(file.filename, blob, year)
+                return JSONResponse({
+                    "proposed": events,
+                    "assumptions": [f"LLM parse failed → fallback to rule parser: {e}"],
+                    "used": "llm_fallback_rule"
+                })
+
+        # rule-based path (no LLM)
+        events = parse_schedule(file.filename, blob, year)
+        return JSONResponse({"proposed": events, "assumptions": [], "used": "rule"})
+
     except Exception as e:
-        # log more detail for debugging
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=503, detail=f"agent_plan_failed: {e}")
+        # surface exact reason to the client for debugging
+        raise HTTPException(status_code=400, detail=f"schedule_ingest_failed: {e}")
+
+@app.post("/schedule/commit")
+def schedule_commit(payload: dict):
+    """
+    payload: { "events":[{"summary","start","end","location","description"}] }
+    Creates events in Google Calendar.
+    """
+    try:
+        created = []
+        for e in payload.get("events", []):
+            c = add_event(
+                summary=e.get("summary","(no title)"),
+                start_iso_local=e.get("start"),
+                end_iso_local=e.get("end"),
+                description=e.get("description",""),
+                location=e.get("location",""),
+                tz_str="America/Phoenix"
+            )
+            created.append({"id": c.get("id"), "htmlLink": c.get("htmlLink")})
+        return JSONResponse({"created": created})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"schedule_commit_failed: {e}")

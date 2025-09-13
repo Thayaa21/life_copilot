@@ -199,6 +199,65 @@ if submit:
     except Exception as e:
         st.error(f"Create error: {e}")
 
+# st.header("Schedule Import")
+
+# # CSV only (title,days,times,dates,location)
+# uploaded = st.file_uploader(
+#     "Upload schedule CSV (headers: title, days, times, dates, location)",
+#     type=["csv"]
+# )
+
+# if uploaded is not None:
+#     try:
+#         files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type or "text/csv")}
+#         # CSV-only ⇒ force rule parser; don't send LLM flags
+#         r = requests.post(f"{API}/schedule/ingest", files=files, data={"use_llm": "false"}, timeout=60)
+#         if not r.ok:
+#             st.error(r.text)
+#         else:
+#             resp = r.json()
+#             events = resp.get("proposed", [])
+#             if not events:
+#                 st.warning("No events recognized from the CSV. Check headers and sample rows.")
+#             else:
+#                 st.success(f"Parsed {len(events)} event(s). Review and edit below, then add to Calendar:")
+#                 editable = []
+#                 for i, e in enumerate(events, 1):
+#                     col1, col2, col3 = st.columns([2,2,2])
+#                     with col1:
+#                         summary = st.text_input(f"Summary #{i}", e.get("summary","(no title)"), key=f"ev_s_{i}")
+#                     with col2:
+#                         start = st.text_input(f"Start #{i} (YYYY-MM-DDTHH:MM)", e.get("start",""), key=f"ev_st_{i}")
+#                     with col3:
+#                         end = st.text_input(f"End #{i} (YYYY-MM-DDTHH:MM or blank)", e.get("end","") or "", key=f"ev_en_{i}")
+#                     loc = st.text_input(f"Location #{i}", e.get("location","") or "", key=f"ev_l_{i}")
+#                     notes = st.text_input(f"Notes #{i}", e.get("notes","") or "", key=f"ev_n_{i}")
+#                     editable.append({
+#                         "summary": summary,
+#                         "start": start,
+#                         "end": end or None,
+#                         "location": loc,
+#                         "description": notes  # goes into Calendar description
+#                     })
+
+#                 confirm = st.checkbox("I reviewed and confirm these events are correct.")
+#                 if st.button("Add to Google Calendar", disabled=not confirm):
+#                     try:
+#                         r2 = requests.post(f"{API}/schedule/commit", json={"events": editable}, timeout=90)
+#                         if r2.ok:
+#                             created = r2.json().get("created", [])
+#                             st.success(f"Created {len(created)} event(s).")
+#                             for c in created:
+#                                 link = c.get("htmlLink")
+#                                 if link:
+#                                     st.markdown(f"- [Open event]({link})")
+#                         else:
+#                             st.error(r2.text)
+#                     except Exception as e:
+#                         st.error(f"Commit error: {e}")
+#     except Exception as e:
+#         st.error(f"Ingest error: {e}")
+
 # ───────────────────────────────── Recommendations (+ Order-by reminder)
 st.header("Recommendations")
 
@@ -381,3 +440,38 @@ if act:
         if p.get("map_url"): links.append(f"[Map]({p['map_url']})")
         if links:
             st.markdown(" · ".join(links))
+st.header("Daily Brief")
+
+colb1, colb2 = st.columns([1,2])
+
+with colb1:
+    run_now = st.button("Run brief now")
+    set_time = st.text_input("Daily time (HH:MM)", "07:00")
+    enable_brief = st.checkbox("Enable daily brief", value=True)
+    if st.button("Save brief schedule"):
+        try:
+            r = requests.post(f"{API}/brief/config", json={"time": set_time, "enabled": enable_brief}, timeout=10)
+            if r.ok:
+                st.success("Brief schedule saved.")
+            else:
+                st.error(r.text)
+        except Exception as e:
+            st.error(f"Save error: {e}")
+
+with colb2:
+    if run_now:
+        try:
+            r = requests.post(f"{API}/brief/run", json={"create_leave_event": True}, timeout=90)
+            if r.ok:
+                data = r.json()
+                st.success("Brief ready.")
+                st.markdown("#### Report")
+                st.code(data.get("report_md",""), language="markdown")
+                if data.get("report_path"):
+                    st.caption(f"Saved → {data['report_path']}")
+                if data.get("created_leave"):
+                    st.caption("Added 'Leave by' reminder to Calendar.")
+            else:
+                st.error(r.text)
+        except Exception as e:
+            st.error(f"Brief error: {e}")
